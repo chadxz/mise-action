@@ -28779,9 +28779,31 @@ var __awaiter$h = (undefined && undefined.__awaiter) || function (thisArg, _argu
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-const { chmod, copyFile, lstat, mkdir, open, readdir, rename, rm, rmdir, stat, symlink, unlink } = fs.promises;
+const { chmod, copyFile: copyFile$1, lstat, mkdir, open, readdir, rename, rm, rmdir, stat, symlink, unlink } = fs.promises;
 // export const {open} = 'fs'
 const IS_WINDOWS$c = process.platform === 'win32';
+/**
+ * Custom implementation of readlink to ensure Windows junctions
+ * maintain trailing backslash for backward compatibility with Node.js < 24
+ *
+ * In Node.js 20, Windows junctions (directory symlinks) always returned paths
+ * with trailing backslashes. Node.js 24 removed this behavior, which breaks
+ * code that relied on this format for path operations.
+ *
+ * This implementation restores the Node 20 behavior by adding a trailing
+ * backslash to all junction results on Windows.
+ */
+function readlink(fsPath) {
+    return __awaiter$h(this, void 0, void 0, function* () {
+        const result = yield fs.promises.readlink(fsPath);
+        // On Windows, restore Node 20 behavior: add trailing backslash to all results
+        // since junctions on Windows are always directory links
+        if (IS_WINDOWS$c && !result.endsWith('\\')) {
+            return `${result}\\`;
+        }
+        return result;
+    });
+}
 fs.constants.O_RDONLY;
 function exists(fsPath) {
     return __awaiter$h(this, void 0, void 0, function* () {
@@ -28927,6 +28949,47 @@ var __awaiter$g = (undefined && undefined.__awaiter) || function (thisArg, _argu
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
+/**
+ * Copies a file or folder.
+ * Based off of shelljs - https://github.com/shelljs/shelljs/blob/9237f66c52e5daa40458f94f9565e18e8132f5a6/src/cp.js
+ *
+ * @param     source    source path
+ * @param     dest      destination path
+ * @param     options   optional. See CopyOptions.
+ */
+function cp(source_1, dest_1) {
+    return __awaiter$g(this, arguments, void 0, function* (source, dest, options = {}) {
+        const { force, recursive, copySourceDirectory } = readCopyOptions(options);
+        const destStat = (yield exists(dest)) ? yield stat(dest) : null;
+        // Dest is an existing file, but not forcing
+        if (destStat && destStat.isFile() && !force) {
+            return;
+        }
+        // If dest is an existing directory, should copy inside.
+        const newDest = destStat && destStat.isDirectory() && copySourceDirectory
+            ? path$1.join(dest, path$1.basename(source))
+            : dest;
+        if (!(yield exists(source))) {
+            throw new Error(`no such file or directory: ${source}`);
+        }
+        const sourceStat = yield stat(source);
+        if (sourceStat.isDirectory()) {
+            if (!recursive) {
+                throw new Error(`Failed to copy. ${source} is a directory, but tried to copy without recursive flag.`);
+            }
+            else {
+                yield cpDirRecursive(source, newDest, 0, force);
+            }
+        }
+        else {
+            if (path$1.relative(source, newDest) === '') {
+                // a file cannot be copied to itself
+                throw new Error(`'${newDest}' and '${source}' are the same file`);
+            }
+            yield copyFile(source, newDest, force);
+        }
+    });
+}
 /**
  * Moves a path.
  *
@@ -29084,6 +29147,64 @@ function findInPath(tool) {
             }
         }
         return matches;
+    });
+}
+function readCopyOptions(options) {
+    const force = options.force == null ? true : options.force;
+    const recursive = Boolean(options.recursive);
+    const copySourceDirectory = options.copySourceDirectory == null
+        ? true
+        : Boolean(options.copySourceDirectory);
+    return { force, recursive, copySourceDirectory };
+}
+function cpDirRecursive(sourceDir, destDir, currentDepth, force) {
+    return __awaiter$g(this, void 0, void 0, function* () {
+        // Ensure there is not a run away recursive copy
+        if (currentDepth >= 255)
+            return;
+        currentDepth++;
+        yield mkdirP(destDir);
+        const files = yield readdir(sourceDir);
+        for (const fileName of files) {
+            const srcFile = `${sourceDir}/${fileName}`;
+            const destFile = `${destDir}/${fileName}`;
+            const srcFileStat = yield lstat(srcFile);
+            if (srcFileStat.isDirectory()) {
+                // Recurse
+                yield cpDirRecursive(srcFile, destFile, currentDepth, force);
+            }
+            else {
+                yield copyFile(srcFile, destFile, force);
+            }
+        }
+        // Change the mode for the newly created directory
+        yield chmod(destDir, (yield stat(sourceDir)).mode);
+    });
+}
+// Buffered file copy
+function copyFile(srcFile, destFile, force) {
+    return __awaiter$g(this, void 0, void 0, function* () {
+        if ((yield lstat(srcFile)).isSymbolicLink()) {
+            // unlink/re-link it
+            try {
+                yield lstat(destFile);
+                yield unlink(destFile);
+            }
+            catch (e) {
+                // Try to override file permission
+                if (e.code === 'EPERM') {
+                    yield chmod(destFile, '0666');
+                    yield unlink(destFile);
+                }
+                // other errors = it doesn't exist, no work to do
+            }
+            // Copy over symlink
+            const symlinkFull = yield readlink(srcFile);
+            yield symlink(symlinkFull, destFile, IS_WINDOWS$c ? 'junction' : null);
+        }
+        else if (!(yield exists(destFile)) || force) {
+            yield copyFile$1(srcFile, destFile);
+        }
     });
 }
 
@@ -29979,32 +30100,6 @@ function group(name, fn) {
         }
         return result;
     });
-}
-//-----------------------------------------------------------------------
-// Wrapper action state
-//-----------------------------------------------------------------------
-/**
- * Saves state for current action, the state can only be retrieved by this action's post job execution.
- *
- * @param     name     name of the state to store
- * @param     value    value to store. Non-string values will be converted to a string via JSON.stringify
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function saveState(name, value) {
-    const filePath = process.env['GITHUB_STATE'] || '';
-    if (filePath) {
-        return issueFileCommand('STATE', prepareKeyValueMessage(name, value));
-    }
-    issueCommand('save-state', { name }, toCommandValue(value));
-}
-/**
- * Gets the value of an state set by this action's main execution.
- *
- * @param     name     name of the state to get
- * @returns   string
- */
-function getState(name) {
-    return process.env[`STATE_${name}`] || '';
 }
 
 /**
@@ -72923,7 +73018,7 @@ function commitCache(httpClient, cacheId, filesize) {
         }));
     });
 }
-function saveCache$2(cacheId, archivePath, signedUploadURL, options) {
+function saveCache$1(cacheId, archivePath, signedUploadURL, options) {
     return __awaiter$6(this, void 0, void 0, function* () {
         const uploadOptions = getUploadOptions(options);
         if (uploadOptions.useAzureSdk) {
@@ -77185,7 +77280,7 @@ function restoreCacheV2(paths_1, primaryKey_1, restoreKeys_1, options_1) {
  * @param options cache upload options
  * @returns number returns cacheId if the cache was saved successfully and throws an error if save fails
  */
-function saveCache$1(paths_1, key_1, options_1) {
+function saveCache(paths_1, key_1, options_1) {
     return __awaiter$3(this, arguments, void 0, function* (paths, key, options, enableCrossOsArchive = false) {
         const cacheServiceVersion = getCacheServiceVersion();
         debug(`Cache service version: ${cacheServiceVersion}`);
@@ -77251,7 +77346,7 @@ function saveCacheV1(paths_1, key_1, options_1) {
                 throw new ReserveCacheError(`Unable to reserve cache with key ${key}, another job may be creating this cache. More details: ${(_e = reserveCacheResponse === null || reserveCacheResponse === void 0 ? void 0 : reserveCacheResponse.error) === null || _e === void 0 ? void 0 : _e.message}`);
             }
             debug(`Saving Cache (ID: ${cacheId})`);
-            yield saveCache$2(cacheId, archivePath, '', options);
+            yield saveCache$1(cacheId, archivePath, '', options);
         }
         catch (error$1) {
             const typedError = error$1;
@@ -77343,7 +77438,7 @@ function saveCacheV2(paths_1, key_1, options_1) {
                 throw new ReserveCacheError(`Unable to reserve cache with key ${key}, another job may be creating this cache.`);
             }
             debug(`Attempting to upload cache located at: ${archivePath}`);
-            yield saveCache$2(cacheId, archivePath, signedUploadUrl, options);
+            yield saveCache$1(cacheId, archivePath, signedUploadUrl, options);
             const finalizeRequest = {
                 key,
                 version,
@@ -89242,17 +89337,24 @@ const MISE_CONFIG_FILE_PATTERNS = [
     `**/.tool-versions`
 ];
 // Default cache key template
-const DEFAULT_CACHE_KEY_TEMPLATE = '{{cache_key_prefix}}-{{platform}}{{#if version}}-{{version}}{{/if}}{{#if mise_env}}-{{mise_env}}{{/if}}{{#if install_args_hash}}-{{install_args_hash}}{{/if}}-{{#if file_hash}}{{file_hash}}{{else}}no-config{{/if}}';
+const DEFAULT_CACHE_KEY_TEMPLATE = '{{cache_key_prefix}}-{{platform}}-{{dir_hash}}{{#if version}}-{{version}}{{/if}}{{#if mise_env}}-{{mise_env}}{{/if}}{{#if install_args_hash}}-{{install_args_hash}}{{/if}}-{{#if file_hash}}{{file_hash}}{{else}}no-config{{/if}}';
 async function run() {
     try {
         await setToolVersions();
         await setMiseToml();
-        let cacheKey;
-        if (getBooleanInput('cache')) {
-            cacheKey = await restoreMiseCache();
+        const version = getInput('version');
+        const resolvedLatestVersion = version
+            ? undefined
+            : await latestMiseVersion();
+        const cacheEnabled = getBooleanInput('cache');
+        // Restore binary cache, install mise, save binary cache if needed
+        let binaryCache = { key: '', hit: false };
+        if (cacheEnabled) {
+            binaryCache = await restoreMiseBinaryCache(version, resolvedLatestVersion);
         }
-        else {
-            setOutput('cache-hit', false);
+        await setupMise(version, getBooleanInput('fetch_from_github'), resolvedLatestVersion);
+        if (cacheEnabled) {
+            await saveMiseBinaryCache(binaryCache);
         }
         // Wings opt-in hook (experimental). When
         // `wings_enabled: true` is set, this exports
@@ -89272,9 +89374,12 @@ async function run() {
         // runs. Greptile + Gemini both flagged the previous
         // comment as overstating what the early call accelerates.
         setupWings();
-        const version = getInput('version');
-        const fetchFromGitHub = getBooleanInput('fetch_from_github');
-        await setupMise(version, fetchFromGitHub);
+        // Restore tools cache (needs mise installed to compute key for working_directory)
+        let toolsCache = { key: '', hit: false };
+        if (cacheEnabled) {
+            toolsCache = await restoreToolsCache();
+        }
+        setOutput('cache-hit', toolsCache.hit);
         await setEnvVars();
         if (getBooleanInput('reshim')) {
             await miseReshim();
@@ -89282,13 +89387,12 @@ async function run() {
         await testMise();
         if (getBooleanInput('install')) {
             await miseInstall();
-            if (cacheKey && getBooleanInput('cache_save')) {
-                await saveCache(cacheKey);
+            if (cacheEnabled) {
+                await saveToolsCache(toolsCache);
             }
         }
         await miseLs();
-        const loadEnv = getBooleanInput('env');
-        if (loadEnv) {
+        if (getBooleanInput('env')) {
             await exportMiseEnv();
         }
     }
@@ -89440,23 +89544,106 @@ async function setEnvVars() {
         addPath(shimsDir);
     }
 }
-async function restoreMiseCache() {
-    startGroup('Restoring mise cache');
-    const cachePath = miseDir();
-    // Use custom cache key if provided, otherwise use default template
-    const cacheKeyTemplate = getInput('cache_key') || DEFAULT_CACHE_KEY_TEMPLATE;
-    const primaryKey = await processCacheKeyTemplate(cacheKeyTemplate);
-    saveState('PRIMARY_KEY', primaryKey);
-    saveState('MISE_DIR', cachePath);
-    const cacheKey = await restoreCache([cachePath], primaryKey);
-    setOutput('cache-hit', Boolean(cacheKey));
-    if (!cacheKey) {
-        info(`mise cache not found for ${primaryKey}`);
-        return primaryKey;
-    }
-    info(`mise cache restored from key: ${cacheKey}`);
+async function restoreMiseBinaryCache(version, resolvedLatestVersion) {
+    const binPath = path$1.join(miseDir(), 'bin');
+    const platform = `${await getTarget()}-${getRunnerImageId()}`;
+    const resolvedVersion = cleanVersion(version || resolvedLatestVersion || (await latestMiseVersion()));
+    const cacheKeyPrefix = getInput('cache_key_prefix') || 'mise-v1';
+    // Include hash of miseDir path to handle custom mise_dir configurations
+    const dirHash = crypto$1
+        .createHash('sha256')
+        .update(miseDir())
+        .digest('hex')
+        .slice(0, 8);
+    const key = `${cacheKeyPrefix}-binary-${platform}-${resolvedVersion}-${dirHash}`;
+    const cacheKey = await group('Restoring mise binary cache', async () => {
+        const restored = await restoreCache([binPath], key);
+        if (restored) {
+            info(`mise binary cache restored from key: ${restored}`);
+        }
+        else {
+            info(`mise binary cache not found for ${key}`);
+        }
+        return restored;
+    });
+    return { key, hit: Boolean(cacheKey) };
 }
-async function setupMise(version, fetchFromGitHub = false) {
+async function saveMiseBinaryCache(state) {
+    if (!getBooleanInput('cache_save') || state.hit || !state.key) {
+        return;
+    }
+    await group('Saving mise binary cache', async () => {
+        const binPath = path$1.join(miseDir(), 'bin');
+        if (!fs.existsSync(binPath)) {
+            throw new Error(`Binary cache folder path does not exist on disk: ${binPath}`);
+        }
+        const cacheId = await saveCache([binPath], state.key);
+        if (cacheId !== -1) {
+            info(`Binary cache saved with key: ${state.key}`);
+        }
+    });
+}
+/**
+ * Runs a function while preserving the mise binary. The tools cache includes
+ * bin/, so restoring it could overwrite the binary that setupMise() just
+ * installed. This backs up the binary files before and restores them after.
+ */
+async function withBinaryBackup(fn) {
+    const binDir = path$1.join(miseDir(), 'bin');
+    const binaryName = process.platform === 'win32' ? 'mise.exe' : 'mise';
+    const requiredBinaryPath = path$1.join(binDir, binaryName);
+    const backupDir = await fs.promises.mkdtemp(path$1.join(os.tmpdir(), 'mise-binary-backup-'));
+    const binaryNames = process.platform === 'win32' ? [binaryName, 'mise-shim.exe'] : [binaryName];
+    const backedUpBinaries = [];
+    try {
+        if (!fs.existsSync(requiredBinaryPath)) {
+            throw new Error(`Expected binary at ${requiredBinaryPath} but it does not exist`);
+        }
+        for (const name of binaryNames) {
+            const binaryPath = path$1.join(binDir, name);
+            if (fs.existsSync(binaryPath)) {
+                await cp(binaryPath, path$1.join(backupDir, name));
+                backedUpBinaries.push(name);
+            }
+        }
+        try {
+            return await fn();
+        }
+        finally {
+            await rmRF(binDir);
+            await fs.promises.mkdir(binDir, { recursive: true });
+            for (const name of backedUpBinaries) {
+                await cp(path$1.join(backupDir, name), path$1.join(binDir, name), {
+                    force: true
+                });
+            }
+        }
+    }
+    finally {
+        await rmRF(backupDir);
+    }
+}
+async function restoreToolsCache() {
+    const cacheKeyTemplate = getInput('cache_key') || DEFAULT_CACHE_KEY_TEMPLATE;
+    const key = await processCacheKeyTemplate(cacheKeyTemplate);
+    if (!key) {
+        info('Tools caching disabled');
+        return { key: '', hit: false };
+    }
+    const cacheKey = await withBinaryBackup(() => group('Restoring mise tools cache', async () => {
+        const cachePath = miseDir();
+        const restored = await restoreCache([cachePath], key);
+        if (restored) {
+            info(`mise tools cache restored from key: ${restored}`);
+        }
+        else {
+            info(`mise tools cache not found for ${key}`);
+        }
+        return restored;
+    }));
+    return { key, hit: Boolean(cacheKey) };
+}
+async function setupMise(version, fetchFromGitHub = false, resolvedLatestVersion) {
     const miseBinDir = path$1.join(miseDir(), 'bin');
     const miseBinPath = path$1.join(miseBinDir, process.platform === 'win32' ? 'mise.exe' : 'mise');
     const miseShimPath = path$1.join(miseBinDir, 'mise-shim.exe');
@@ -89471,7 +89658,7 @@ async function setupMise(version, fetchFromGitHub = false) {
                 : (await zstdInstalled())
                     ? '.tar.zst'
                     : '.tar.gz';
-        let resolvedVersion = version || (await latestMiseVersion());
+        let resolvedVersion = version || resolvedLatestVersion || (await latestMiseVersion());
         resolvedVersion = resolvedVersion.replace(/^v/, '');
         let url;
         if (!fetchFromGitHub && !version) {
@@ -89645,9 +89832,6 @@ function getCwd() {
         process.cwd());
 }
 function miseDir() {
-    const dir = getState('MISE_DIR');
-    if (dir)
-        return dir;
     const miseDir = getInput('mise_dir');
     if (miseDir)
         return miseDir;
@@ -89660,16 +89844,19 @@ function miseDir() {
         return path$1.join(LOCALAPPDATA, 'mise');
     return path$1.join(os.homedir(), '.local', 'share', 'mise');
 }
-async function saveCache(cacheKey) {
-    await group(`Saving mise cache`, async () => {
+async function saveToolsCache(state) {
+    if (!getBooleanInput('cache_save') || state.hit || !state.key) {
+        return;
+    }
+    await group('Saving mise tools cache', async () => {
         const cachePath = miseDir();
         if (!fs.existsSync(cachePath)) {
             throw new Error(`Cache folder path does not exist on disk: ${cachePath}`);
         }
-        const cacheId = await saveCache$1([cachePath], cacheKey);
-        if (cacheId === -1)
-            return;
-        info(`Cache saved from ${cachePath} with key: ${cacheKey}`);
+        const cacheId = await saveCache([cachePath], state.key);
+        if (cacheId !== -1) {
+            info(`Tools cache saved with key: ${state.key}`);
+        }
     });
 }
 async function getTarget() {
@@ -89703,8 +89890,40 @@ async function processCacheKeyTemplate(template) {
     const cacheKeyPrefix = getInput('cache_key_prefix') || 'mise-v1';
     const miseEnv = process.env.MISE_ENV?.replace(/,/g, '-');
     const platform = `${await getTarget()}-${getRunnerImageId()}`;
+    const workingDirectory = getInput('working_directory') || getInput('install_dir');
+    const githubWorkspace = path$1.resolve(process.env.GITHUB_WORKSPACE || process.cwd());
     // Calculate file hash
-    const fileHash = await hashFiles(MISE_CONFIG_FILE_PATTERNS.join('\n'));
+    // When working_directory is set, use mise config ls to get only relevant config files
+    // Otherwise, use the glob pattern to get all config files in the repo
+    let fileHash;
+    if (workingDirectory) {
+        const configFiles = await configFilesForPath(workingDirectory);
+        // Hash the contents of the config files
+        // Include file path in each update to prevent collisions between different
+        // file arrangements with the same concatenated content (e.g., "ab"+"cdef"
+        // vs "abc"+"def")
+        const hash = crypto$1.createHash('sha256');
+        try {
+            for (const file of configFiles) {
+                const relativePath = path$1
+                    .relative(githubWorkspace, file)
+                    .split(path$1.sep)
+                    .join('/');
+                hash.update(relativePath);
+                hash.update('\0');
+                const content = await fs.promises.readFile(file);
+                hash.update(content);
+                hash.update('\0');
+            }
+            fileHash = hash.digest('hex');
+        }
+        catch (error) {
+            throw new Error(`Failed to read config file for cache key: ${errorMessage(error)}`, { cause: error });
+        }
+    }
+    else {
+        fileHash = await hashFiles(MISE_CONFIG_FILE_PATTERNS.join('\n'));
+    }
     // Calculate install args hash
     let installArgsHash = '';
     if (installArgs) {
@@ -89717,12 +89936,20 @@ async function processCacheKeyTemplate(template) {
             installArgsHash = crypto$1.createHash('sha256').update(tools).digest('hex');
         }
     }
+    // Calculate mise dir hash to isolate caches for different mise_dir configurations
+    // This matches the binary cache key which also includes dir_hash
+    const dirHash = crypto$1
+        .createHash('sha256')
+        .update(miseDir())
+        .digest('hex')
+        .slice(0, 8);
     // Prepare base template data
     const baseTemplateData = {
         version,
         cache_key_prefix: cacheKeyPrefix,
         platform,
         file_hash: fileHash,
+        dir_hash: dirHash,
         mise_env: miseEnv,
         install_args_hash: installArgsHash
     };
@@ -89746,5 +89973,69 @@ async function isMusl() {
         ignoreReturnCode: true
     });
     return stderr.indexOf('musl') > -1;
+}
+/**
+ * Checks if a file path is contained within a directory.
+ *
+ * Uses path.relative() to compute the relative path from parent to child.
+ * If the result starts with ".." or is absolute, the child is outside the parent.
+ *
+ * @example
+ * isPathWithin("/workspace", "/workspace/src/file.ts")     // true
+ * isPathWithin("/workspace", "/workspace-other/file.ts")   // false (not a child)
+ * isPathWithin("/workspace", "/etc/passwd")                // false (unrelated)
+ * isPathWithin("C:\\work", "D:\\other\\file.ts")           // false (different drive on Windows)
+ */
+function isPathWithin(parent, child) {
+    const relative = path$1.relative(parent, child);
+    return !relative.startsWith('..') && !path$1.isAbsolute(relative);
+}
+/**
+ * Get config files that affect the given working directory using `mise config ls --json`.
+ * This returns the hierarchy of configs (directory's own config + inherited parents).
+ * Filters to only files within GITHUB_WORKSPACE and adds corresponding .lock files.
+ */
+async function configFilesForPath(workingDirectory) {
+    const githubWorkspace = path$1.resolve(process.env.GITHUB_WORKSPACE || process.cwd());
+    const cwd = path$1.resolve(githubWorkspace, workingDirectory);
+    // Use explicit path to mise binary instead of relying on PATH
+    const miseBinPath = path$1.join(miseDir(), 'bin', process.platform === 'win32' ? 'mise.exe' : 'mise');
+    try {
+        const output = await getExecOutput(miseBinPath, ['config', 'ls', '--json'], {
+            cwd,
+            silent: true
+        });
+        const configs = JSON.parse(output.stdout);
+        const configFiles = [];
+        for (const config of configs) {
+            const configPath = path$1.isAbsolute(config.path)
+                ? config.path
+                : path$1.resolve(cwd, config.path);
+            // Filter to only files within GITHUB_WORKSPACE
+            if (!isPathWithin(githubWorkspace, configPath)) {
+                continue;
+            }
+            configFiles.push(configPath);
+            // Include corresponding lock files if they exist
+            let lockPath;
+            if (configPath.endsWith('.toml')) {
+                // mise.toml -> mise.lock
+                lockPath = configPath.replace(/\.toml$/, '.lock');
+            }
+            else if (configPath.endsWith('.tool-versions')) {
+                // .tool-versions -> mise.lock in the same directory
+                lockPath = path$1.join(path$1.dirname(configPath), 'mise.lock');
+            }
+            if (lockPath &&
+                fs.existsSync(lockPath) &&
+                !configFiles.includes(lockPath)) {
+                configFiles.push(lockPath);
+            }
+        }
+        return configFiles.sort();
+    }
+    catch (error) {
+        throw new Error(`Failed to get config files for working_directory "${workingDirectory}": ${errorMessage(error)}`, { cause: error });
+    }
 }
 //# sourceMappingURL=index.js.map

@@ -50,12 +50,13 @@ You can customize the cache key used by the action:
 - uses: jdx/mise-action@v4
   with:
     cache_key: "my-custom-cache-key"  # Override the entire cache key
-    cache_key_prefix: "mise-v1"       # Or just change the prefix (default: "mise-v0")
+    cache_key_prefix: "mise-v1"       # Or just change the prefix
 ```
 
 ### Template Variables in Cache Keys
 
-When using `cache_key`, you can use template variables to reference internal values:
+When using `cache_key`, you can use template variables to reference internal
+values:
 
 ```yaml
 - uses: jdx/mise-action@v4
@@ -66,15 +67,28 @@ When using `cache_key`, you can use template variables to reference internal val
 ```
 
 Available template variables:
+
 - `{{version}}` - The mise version (from the `version` input)
-- `{{cache_key_prefix}}` - The cache key prefix (from `cache_key_prefix` input or default)
-- `{{platform}}` - The target platform, including the runner image (e.g., "linux-x64-ubuntu24", "macos-arm64-macos15", "linux-x64-self-hosted"). The trailing segment is `process.env.ImageOS` on github-hosted runners and falls back to `"self-hosted"` elsewhere — preventing cache collisions when the same repo runs on different runner providers (github-hosted, namespace.so, self-hosted).
-- `{{file_hash}}` - Hash of all mise configuration files
+- `{{cache_key_prefix}}` - The cache key prefix (from `cache_key_prefix`
+  input or default)
+- `{{platform}}` - The target platform, including the runner image, for
+  example `linux-x64-ubuntu24`, `macos-arm64-macos15`, or
+  `linux-x64-self-hosted`. The trailing segment is `process.env.ImageOS` on
+  github-hosted runners and falls back to `"self-hosted"` elsewhere,
+  preventing cache collisions when the same repo runs on different runner
+  providers.
+- `{{dir_hash}}` - SHA256 hash prefix of the resolved mise data directory,
+  used to isolate caches when `mise_dir`, `MISE_DATA_DIR`, `XDG_DATA_HOME`, or
+  `LOCALAPPDATA` point to different locations.
+- `{{file_hash}}` - Hash of mise configuration files. When
+  `working_directory` is set, this only includes the config hierarchy that
+  applies to that directory, plus matching lock files.
 - `{{mise_env}}` - The MISE_ENV environment variable value
 - `{{install_args_hash}}` - SHA256 hash of the sorted tools from install args
 - `{{default}}` - The processed default cache key (useful for extending)
 
-Conditional logic is also supported using Handlebars syntax like `{{#if version}}...{{/if}}`.
+Conditional logic is also supported using Handlebars syntax like
+`{{#if version}}...{{/if}}`.
 
 Example using multiple variables:
 ```yaml
