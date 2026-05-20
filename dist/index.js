@@ -89893,8 +89893,9 @@ async function processCacheKeyTemplate(template) {
     const workingDirectory = getInput('working_directory') || getInput('install_dir');
     const githubWorkspace = path$1.resolve(process.env.GITHUB_WORKSPACE || process.cwd());
     // Calculate file hash
-    // When working_directory is set, use mise config ls to get only relevant config files
-    // Otherwise, use the glob pattern to get all config files in the repo
+    // When working_directory is set, use mise config ls to get the relevant
+    // config hierarchy, then hash only mise config material from that result.
+    // Otherwise, use the glob pattern to get all config files in the repo.
     let fileHash;
     if (workingDirectory) {
         const configFiles = await configFilesForPath(workingDirectory);
@@ -89909,6 +89910,15 @@ async function processCacheKeyTemplate(template) {
                     .relative(githubWorkspace, file)
                     .split(path$1.sep)
                     .join('/');
+                if (!fs.existsSync(file)) {
+                    debug(`Skipping missing mise config file while building cache key: ${relativePath}`);
+                    continue;
+                }
+                const stat = await fs.promises.stat(file);
+                if (!stat.isFile()) {
+                    debug(`Skipping non-file mise config path while building cache key: ${relativePath}`);
+                    continue;
+                }
                 hash.update(relativePath);
                 hash.update('\0');
                 const content = await fs.promises.readFile(file);
@@ -89990,10 +90000,28 @@ function isPathWithin(parent, child) {
     const relative = path$1.relative(parent, child);
     return !relative.startsWith('..') && !path$1.isAbsolute(relative);
 }
+function isMiseConfigFile(filePath) {
+    const normalized = filePath.split(path$1.sep).join('/');
+    const basename = path$1.basename(normalized);
+    if (basename === '.tool-versions') {
+        return true;
+    }
+    if (/^\.?mise(?:\..+)?\.(?:toml|lock)$/.test(basename)) {
+        return true;
+    }
+    if (!/^config(?:\..+)?\.(?:toml|lock)$/.test(basename)) {
+        return false;
+    }
+    const parent = path$1.dirname(normalized);
+    return (parent.endsWith('/.config/mise') ||
+        parent.endsWith('/.mise') ||
+        parent.endsWith('/mise'));
+}
 /**
  * Get config files that affect the given working directory using `mise config ls --json`.
  * This returns the hierarchy of configs (directory's own config + inherited parents).
- * Filters to only files within GITHUB_WORKSPACE and adds corresponding .lock files.
+ * Filters to mise config files within GITHUB_WORKSPACE and adds corresponding
+ * lock files.
  */
 async function configFilesForPath(workingDirectory) {
     const githubWorkspace = path$1.resolve(process.env.GITHUB_WORKSPACE || process.cwd());
@@ -90013,6 +90041,10 @@ async function configFilesForPath(workingDirectory) {
                 : path$1.resolve(cwd, config.path);
             // Filter to only files within GITHUB_WORKSPACE
             if (!isPathWithin(githubWorkspace, configPath)) {
+                continue;
+            }
+            if (!isMiseConfigFile(configPath)) {
+                debug(`Skipping non-mise config path while building cache key: ${configPath}`);
                 continue;
             }
             configFiles.push(configPath);

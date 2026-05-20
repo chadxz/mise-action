@@ -728,8 +728,9 @@ async function processCacheKeyTemplate(template: string): Promise<string> {
   )
 
   // Calculate file hash
-  // When working_directory is set, use mise config ls to get only relevant config files
-  // Otherwise, use the glob pattern to get all config files in the repo
+  // When working_directory is set, use mise config ls to get the relevant
+  // config hierarchy, then hash only mise config material from that result.
+  // Otherwise, use the glob pattern to get all config files in the repo.
   let fileHash: string
   if (workingDirectory) {
     const configFiles = await configFilesForPath(workingDirectory)
@@ -744,6 +745,19 @@ async function processCacheKeyTemplate(template: string): Promise<string> {
           .relative(githubWorkspace, file)
           .split(path.sep)
           .join('/')
+        if (!fs.existsSync(file)) {
+          core.debug(
+            `Skipping missing mise config file while building cache key: ${relativePath}`
+          )
+          continue
+        }
+        const stat = await fs.promises.stat(file)
+        if (!stat.isFile()) {
+          core.debug(
+            `Skipping non-file mise config path while building cache key: ${relativePath}`
+          )
+          continue
+        }
         hash.update(relativePath)
         hash.update('\0')
         const content = await fs.promises.readFile(file)
@@ -835,10 +849,35 @@ function isPathWithin(parent: string, child: string): boolean {
   return !relative.startsWith('..') && !path.isAbsolute(relative)
 }
 
+function isMiseConfigFile(filePath: string): boolean {
+  const normalized = filePath.split(path.sep).join('/')
+  const basename = path.basename(normalized)
+
+  if (basename === '.tool-versions') {
+    return true
+  }
+
+  if (/^\.?mise(?:\..+)?\.(?:toml|lock)$/.test(basename)) {
+    return true
+  }
+
+  if (!/^config(?:\..+)?\.(?:toml|lock)$/.test(basename)) {
+    return false
+  }
+
+  const parent = path.dirname(normalized)
+  return (
+    parent.endsWith('/.config/mise') ||
+    parent.endsWith('/.mise') ||
+    parent.endsWith('/mise')
+  )
+}
+
 /**
  * Get config files that affect the given working directory using `mise config ls --json`.
  * This returns the hierarchy of configs (directory's own config + inherited parents).
- * Filters to only files within GITHUB_WORKSPACE and adds corresponding .lock files.
+ * Filters to mise config files within GITHUB_WORKSPACE and adds corresponding
+ * lock files.
  */
 async function configFilesForPath(workingDirectory: string): Promise<string[]> {
   const githubWorkspace = path.resolve(
@@ -871,6 +910,12 @@ async function configFilesForPath(workingDirectory: string): Promise<string[]> {
         : path.resolve(cwd, config.path)
       // Filter to only files within GITHUB_WORKSPACE
       if (!isPathWithin(githubWorkspace, configPath)) {
+        continue
+      }
+      if (!isMiseConfigFile(configPath)) {
+        core.debug(
+          `Skipping non-mise config path while building cache key: ${configPath}`
+        )
         continue
       }
       configFiles.push(configPath)

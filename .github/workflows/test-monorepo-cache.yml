@@ -302,6 +302,31 @@ jobs:
         env:
           STEPS_BAD_CACHE_KEY_OUTCOME: ${{ steps.bad-cache-key.outcome }}
 
+  # Test that env files discovered through mise config evaluation are not
+  # treated as cache-key inputs. A missing .env should not make setup fail
+  # before the workflow's own commands run.
+  missing-env-file-ignored-for-cache-key:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p apps/charon
+          {
+            echo '[tools]'
+            echo 'node = "24"'
+            echo
+            echo '[env]'
+            echo '_.file = ".env"'
+          } > apps/charon/mise.toml
+      - uses: ./
+        with:
+          working_directory: apps/charon
+          install: false
+          env: false
+          cache_key_prefix: missing-env-${{ github.run_id }}
+
   # Test the legacy no-working_directory path still hashes every repo config.
   legacy-glob-install:
     runs-on: ubuntu-latest
