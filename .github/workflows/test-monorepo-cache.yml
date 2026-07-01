@@ -1,0 +1,387 @@
+name: "test-monorepo-cache"
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  SETUP_MONOREPO: |
+    mkdir -p apps/frontend apps/backend
+    echo '[tools]' > mise.toml
+    echo 'actionlint = "1"' >> mise.toml
+    echo '[tools]' > apps/frontend/mise.toml
+    echo 'shfmt = "3"' >> apps/frontend/mise.toml
+    echo '[tools]' > apps/backend/mise.toml
+    echo 'shellcheck = "0.10"' >> apps/backend/mise.toml
+
+  SETUP_SIMPLE: |
+    echo '[tools]' > mise.toml
+    echo 'actionlint = "1"' >> mise.toml
+
+jobs:
+  install-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_MONOREPO }}
+      - uses: ./
+        with:
+          working_directory: apps/backend
+          cache_key_prefix: monorepo-test-${{ github.run_id }}
+
+  restore-frontend:
+    needs: install-backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_MONOREPO }}
+      - uses: ./
+        with:
+          working_directory: apps/frontend
+          install: false
+          cache_key_prefix: monorepo-test-${{ github.run_id }}
+      - name: Verify frontend did not restore backend cache
+        run: |
+          if [ -f ~/.local/share/mise/shims/shellcheck ]; then
+            echo "FAIL: frontend restored backend cache"
+            exit 1
+          fi
+          echo "PASS: frontend and backend cache keys are isolated"
+
+  install-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_MONOREPO }}
+      - uses: ./
+        with:
+          working_directory: apps/frontend
+          cache_key_prefix: unrelated-${{ github.run_id }}
+
+  unrelated-change-no-bust:
+    needs: install-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_MONOREPO }}
+      - run: echo 'jq = "1"' >> apps/backend/mise.toml
+      - uses: ./
+        with:
+          working_directory: apps/frontend
+          install: false
+          cache_key_prefix: unrelated-${{ github.run_id }}
+      - name: Verify unrelated config did not bust frontend cache
+        run: |
+          if [ ! -f ~/.local/share/mise/shims/shfmt ]; then
+            echo "FAIL: backend config change busted frontend cache"
+            exit 1
+          fi
+          echo "PASS: frontend cache survived unrelated backend change"
+
+  parent-config-change:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_MONOREPO }}
+      - uses: ./
+        with:
+          working_directory: apps/frontend
+          cache_key_prefix: parent-change-${{ github.run_id }}
+      - run: rm -rf ~/.local/share/mise/installs ~/.local/share/mise/shims
+      - run: echo 'taplo = "0.9"' >> mise.toml
+      - uses: ./
+        with:
+          working_directory: apps/frontend
+          install: false
+          cache_key_prefix: parent-change-${{ github.run_id }}
+      - name: Verify parent config change busted cache
+        run: |
+          if [ -f ~/.local/share/mise/shims/shfmt ]; then
+            echo "FAIL: parent config change should have missed cache"
+            exit 1
+          fi
+          echo "PASS: parent config change missed cache"
+
+  lock-file-change:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p apps/project
+          echo '[tools]' > apps/project/mise.toml
+          echo 'shfmt = "3"' >> apps/project/mise.toml
+          echo 'lockfile = "v1"' > apps/project/mise.lock
+      - uses: ./
+        with:
+          working_directory: apps/project
+          cache_key_prefix: lock-change-${{ github.run_id }}
+      - run: rm -rf ~/.local/share/mise/installs ~/.local/share/mise/shims
+      - run: echo 'lockfile = "v2"' > apps/project/mise.lock
+      - uses: ./
+        with:
+          working_directory: apps/project
+          install: false
+          cache_key_prefix: lock-change-${{ github.run_id }}
+      - name: Verify lock file change busted cache
+        run: |
+          if [ -f ~/.local/share/mise/shims/shfmt ]; then
+            echo "FAIL: lock file change should have missed cache"
+            exit 1
+          fi
+          echo "PASS: lock file change missed cache"
+
+  install-identical-content-alpha:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p apps/alpha
+          echo '[tools]' > apps/alpha/mise.toml
+          echo 'shfmt = "3"' >> apps/alpha/mise.toml
+      - uses: ./
+        with:
+          working_directory: apps/alpha
+          cache_key_prefix: identical-content-${{ github.run_id }}
+
+  restore-identical-content-beta:
+    needs: install-identical-content-alpha
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p apps/beta
+          echo '[tools]' > apps/beta/mise.toml
+          echo 'shfmt = "3"' >> apps/beta/mise.toml
+      - uses: ./
+        with:
+          working_directory: apps/beta
+          install: false
+          cache_key_prefix: identical-content-${{ github.run_id }}
+      - name: Verify identical content in a different path missed cache
+        run: |
+          if [ -f ~/.local/share/mise/shims/shfmt ]; then
+            echo "FAIL: identical content in another path hit cache"
+            exit 1
+          fi
+          echo "PASS: identical content in another path missed cache"
+
+  dir-hash-default-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_SIMPLE }}
+      - uses: ./
+        with:
+          cache_key_prefix: dir-hash-${{ github.run_id }}
+
+  dir-hash-custom-restore:
+    needs: dir-hash-default-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_SIMPLE }}
+      - uses: ./
+        with:
+          mise_dir: ${{ runner.temp }}/custom-mise
+          cache_key_prefix: dir-hash-${{ github.run_id }}
+          cache_save: false
+          install: false
+      - name: Verify custom mise_dir did not restore default cache
+        run: |
+          if [ -f "${RUNNER_TEMP}/custom-mise/shims/actionlint" ]; then
+            echo "FAIL: custom mise_dir restored default cache"
+            exit 1
+          fi
+          echo "PASS: different mise_dir values use different cache keys"
+
+  config-hash-failure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_SIMPLE }}
+      - uses: ./
+        id: bad-cache-key
+        continue-on-error: true
+        with:
+          working_directory: does-not-exist
+          install: false
+          cache_key_prefix: config-hash-failure-${{ github.run_id }}
+      - name: Verify config hash failure is surfaced
+        run: |
+          if [ "${STEPS_BAD_CACHE_KEY_OUTCOME}" != "failure" ]; then
+            echo "FAIL: expected config discovery to fail"
+            exit 1
+          fi
+          echo "PASS: config discovery failure failed the action"
+        env:
+          STEPS_BAD_CACHE_KEY_OUTCOME: ${{ steps.bad-cache-key.outcome }}
+
+  missing-env-file-ignored-for-cache-key:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p apps/charon
+          {
+            echo '[tools]'
+            echo 'node = "24"'
+            echo
+            echo '[env]'
+            echo '_.file = ".env"'
+          } > apps/charon/mise.toml
+      - uses: ./
+        with:
+          working_directory: apps/charon
+          install: false
+          env: false
+          cache_key_prefix: missing-env-${{ github.run_id }}
+
+  legacy-glob-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_MONOREPO }}
+      - uses: ./
+        with:
+          cache_key_prefix: legacy-glob-${{ github.run_id }}
+
+  legacy-glob-unrelated-change-busts:
+    needs: legacy-glob-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_MONOREPO }}
+      - run: echo 'jq = "1"' >> apps/backend/mise.toml
+      - uses: ./
+        with:
+          cache_key_prefix: legacy-glob-${{ github.run_id }}
+          cache_save: false
+          install: false
+      - name: Verify legacy glob key changed
+        run: |
+          if [ -f ~/.local/share/mise/shims/actionlint ]; then
+            echo "FAIL: legacy glob cache hit after repo config changed"
+            exit 1
+          fi
+          echo "PASS: legacy glob key changed after repo config changed"
+
+  binary-backup-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_SIMPLE }}
+      - uses: ./
+        with:
+          cache_key_prefix: binary-backup-${{ github.run_id }}
+
+  binary-backup-restore:
+    needs: binary-backup-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - run: ${{ env.SETUP_SIMPLE }}
+      - uses: ./
+        with:
+          cache_key_prefix: binary-backup-${{ github.run_id }}
+      - name: Contaminate bin before a second restore
+        run: |
+          MISE_BIN=~/.local/share/mise/bin
+          mkdir -p "$MISE_BIN/mise-binary-backup-contaminant"
+          touch "$MISE_BIN/extra-file"
+      - uses: ./
+        with:
+          cache_key_prefix: binary-backup-${{ github.run_id }}
+          cache_save: false
+          install: false
+      - name: Verify restore cleaned bin
+        run: |
+          MISE_BIN=~/.local/share/mise/bin
+          FILE_COUNT=$(find "$MISE_BIN" -maxdepth 1 -type f | wc -l)
+          DIR_COUNT=$(find "$MISE_BIN" -maxdepth 1 -mindepth 1 -type d | wc -l)
+          if [ "$FILE_COUNT" -ne 1 ] || [ "$DIR_COUNT" -ne 0 ]; then
+            echo "FAIL: bin should contain only the mise binary"
+            find "$MISE_BIN" -maxdepth 1 -mindepth 1 -print
+            exit 1
+          fi
+          echo "PASS: bin was cleaned during restore"
+
+  windows-binary-backup-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - shell: bash
+        run: ${{ env.SETUP_SIMPLE }}
+      - uses: ./
+        with:
+          cache_key_prefix: windows-binary-backup-${{ github.run_id }}
+
+  windows-binary-backup-restore:
+    needs: windows-binary-backup-install
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - shell: bash
+        run: ${{ env.SETUP_SIMPLE }}
+      - uses: ./
+        with:
+          cache_key_prefix: windows-binary-backup-${{ github.run_id }}
+      - name: Verify Windows bin contains mise and shim
+        shell: pwsh
+        run: |
+          $miseBin = Join-Path $env:LOCALAPPDATA "mise/bin"
+          $files = Get-ChildItem -LiteralPath $miseBin -File
+          $dirs = Get-ChildItem -LiteralPath $miseBin -Directory
+          if ($files.Count -ne 2 -or $dirs.Count -ne 0) {
+            throw "bin should contain only mise.exe and mise-shim.exe"
+          }
+          if (!(Test-Path -LiteralPath (Join-Path $miseBin "mise.exe"))) {
+            throw "mise.exe missing"
+          }
+          if (!(Test-Path -LiteralPath (Join-Path $miseBin "mise-shim.exe"))) {
+            throw "mise-shim.exe missing"
+          }

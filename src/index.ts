@@ -42,7 +42,7 @@ const MISE_CONFIG_FILE_PATTERNS = [
 
 // Default cache key template
 const DEFAULT_CACHE_KEY_TEMPLATE =
-  '{{cache_key_prefix}}-{{platform}}{{#if version}}-{{version}}{{/if}}{{#if mise_env}}-{{mise_env}}{{/if}}{{#if install_args_hash}}-{{install_args_hash}}{{/if}}{{#if bootstrap_hash}}-{{bootstrap_hash}}{{/if}}-{{#if file_hash}}{{file_hash}}{{else}}no-config{{/if}}'
+  '{{cache_key_prefix}}-{{platform}}-{{dir_hash}}{{#if version}}-{{version}}{{/if}}{{#if mise_env}}-{{mise_env}}{{/if}}{{#if install_args_hash}}-{{install_args_hash}}{{/if}}{{#if bootstrap_hash}}-{{bootstrap_hash}}{{/if}}-{{#if file_hash}}{{file_hash}}{{else}}no-config{{/if}}'
 
 const ROOT_MISE_LOCK_FILE_PATTERNS = [/^\.?mise(?:\.[^.]+)?\.lock$/]
 const CONFIG_DIR_MISE_LOCK_FILE_PATTERNS = [/^mise(?:\.[^.]+)?\.lock$/]
@@ -51,14 +51,24 @@ const CONFIG_MISE_LOCK_FILE_PATTERNS = [/^config(?:\.[^.]+)?\.lock$/]
 type DownloadTool = 'curl' | 'wget'
 let cachedDownloadTool: DownloadTool | undefined
 
+interface CacheState {
+  key: string
+  hit: boolean
+}
+
 async function run(): Promise<void> {
   try {
     await setToolVersions()
     await setMiseToml()
 
-    let cacheKey: string | undefined
-    if (core.getBooleanInput('cache')) {
-      cacheKey = await restoreMiseCache()
+    const version = core.getInput('version')
+    const cacheEnabled = core.getBooleanInput('cache')
+    const resolvedLatestVersion =
+      !version && cacheEnabled ? await latestMiseVersion() : undefined
+
+    let binaryCache: CacheState = { key: '', hit: false }
+    if (cacheEnabled) {
+      binaryCache = await restoreMiseBinaryCache(version, resolvedLatestVersion)
     } else {
       core.setOutput('cache-hit', false)
     }
@@ -82,9 +92,18 @@ async function run(): Promise<void> {
     // comment as overstating what the early call accelerates.
     setupWings()
 
-    const version = core.getInput('version')
     const fetchFromGitHub = core.getBooleanInput('fetch_from_github')
-    await setupMise(version, fetchFromGitHub)
+    await setupMise(version, fetchFromGitHub, resolvedLatestVersion)
+    if (cacheEnabled) {
+      await saveMiseBinaryCache(binaryCache)
+    }
+
+    let toolsCache: CacheState = { key: '', hit: false }
+    if (cacheEnabled) {
+      toolsCache = await restoreToolsCache()
+      core.setOutput('cache-hit', toolsCache.hit)
+    }
+
     await setEnvVars()
     if (core.getBooleanInput('reshim')) {
       await miseReshim()
@@ -96,8 +115,9 @@ async function run(): Promise<void> {
       } else {
         await miseInstall()
       }
-      if (cacheKey && core.getBooleanInput('cache_save'))
-        await saveCache(cacheKey)
+      if (cacheEnabled) {
+        await saveToolsCache(toolsCache)
+      }
     }
     await miseLs()
     const loadEnv = core.getBooleanInput('env')
@@ -281,32 +301,138 @@ async function setEnvVars(): Promise<void> {
   }
 }
 
-async function restoreMiseCache(): Promise<string | undefined> {
-  core.startGroup('Restoring mise cache')
-  const cachePath = miseDir()
+/**
+ * Restores only the mise binary cache so setup can run before the tools cache.
+ *
+ * The tools cache key may depend on `mise config ls`, which means the action
+ * needs a working mise binary before it can calculate the final cache key.
+ */
+async function restoreMiseBinaryCache(
+  version: string,
+  resolvedLatestVersion?: string
+): Promise<CacheState> {
+  const binPath = path.join(miseDir(), 'bin')
+  const platform = `${await getTarget()}-${getRunnerImageId()}`
+  const resolvedVersion = cleanVersion(
+    version || resolvedLatestVersion || (await latestMiseVersion())
+  )
+  const cacheKeyPrefix = core.getInput('cache_key_prefix') || 'mise-v1'
+  const dirHash = miseDirHash()
+  const key = `${cacheKeyPrefix}-binary-${platform}-${resolvedVersion}-${dirHash}`
 
-  // Use custom cache key if provided, otherwise use default template
-  const cacheKeyTemplate =
-    core.getInput('cache_key') || DEFAULT_CACHE_KEY_TEMPLATE
-  const primaryKey = await processCacheKeyTemplate(cacheKeyTemplate)
+  const cacheKey = await core.group('Restoring mise binary cache', async () => {
+    const restored = await cache.restoreCache([binPath], key)
+    if (restored) {
+      core.info(`mise binary cache restored from key: ${restored}`)
+    } else {
+      core.info(`mise binary cache not found for ${key}`)
+    }
+    return restored
+  })
 
-  core.saveState('PRIMARY_KEY', primaryKey)
-  core.saveState('MISE_DIR', cachePath)
+  return { key, hit: Boolean(cacheKey) }
+}
 
-  const cacheKey = await cache.restoreCache([cachePath], primaryKey)
-  core.setOutput('cache-hit', Boolean(cacheKey))
-
-  if (!cacheKey) {
-    core.info(`mise cache not found for ${primaryKey}`)
-    return primaryKey
+/**
+ * Saves the mise binary cache after setup installs or updates the binary.
+ */
+async function saveMiseBinaryCache(state: CacheState): Promise<void> {
+  if (!core.getBooleanInput('cache_save') || state.hit || !state.key) {
+    return
   }
 
-  core.info(`mise cache restored from key: ${cacheKey}`)
+  await core.group('Saving mise binary cache', async () => {
+    const binPath = path.join(miseDir(), 'bin')
+    if (!fs.existsSync(binPath)) {
+      throw new Error(
+        `Binary cache folder path does not exist on disk: ${binPath}`
+      )
+    }
+
+    const cacheId = await cache.saveCache([binPath], state.key)
+    if (cacheId !== -1) {
+      core.info(`Binary cache saved with key: ${state.key}`)
+    }
+  })
+}
+
+/**
+ * Runs a callback while preserving the installed mise binaries.
+ *
+ * Restoring the tools cache overlays the full mise data directory, including
+ * `bin/`. We keep only the known mise binaries from setup and recreate `bin/`
+ * after restore so stale cache content cannot accumulate there.
+ */
+async function withBinaryBackup<T>(fn: () => Promise<T>): Promise<T> {
+  const binDir = path.join(miseDir(), 'bin')
+  const binaryName = process.platform === 'win32' ? 'mise.exe' : 'mise'
+  const requiredBinaryPath = path.join(binDir, binaryName)
+  const backupDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), 'mise-binary-backup-')
+  )
+  const binaryNames =
+    process.platform === 'win32' ? [binaryName, 'mise-shim.exe'] : [binaryName]
+  const backedUpBinaries: string[] = []
+
+  try {
+    if (!fs.existsSync(requiredBinaryPath)) {
+      throw new Error(
+        `Expected binary at ${requiredBinaryPath} but it does not exist`
+      )
+    }
+
+    for (const name of binaryNames) {
+      const binaryPath = path.join(binDir, name)
+      if (fs.existsSync(binaryPath)) {
+        await io.cp(binaryPath, path.join(backupDir, name))
+        backedUpBinaries.push(name)
+      }
+    }
+
+    try {
+      return await fn()
+    } finally {
+      await io.rmRF(binDir)
+      await fs.promises.mkdir(binDir, { recursive: true })
+      for (const name of backedUpBinaries) {
+        await io.cp(path.join(backupDir, name), path.join(binDir, name), {
+          force: true
+        })
+      }
+    }
+  } finally {
+    await io.rmRF(backupDir)
+  }
+}
+
+/**
+ * Restores the tools cache after setup installs mise.
+ */
+async function restoreToolsCache(): Promise<CacheState> {
+  const cacheKeyTemplate =
+    core.getInput('cache_key') || DEFAULT_CACHE_KEY_TEMPLATE
+  const key = await processCacheKeyTemplate(cacheKeyTemplate)
+
+  const cacheKey = await withBinaryBackup(() =>
+    core.group('Restoring mise tools cache', async () => {
+      const cachePath = miseDir()
+      const restored = await cache.restoreCache([cachePath], key)
+      if (restored) {
+        core.info(`mise tools cache restored from key: ${restored}`)
+      } else {
+        core.info(`mise tools cache not found for ${key}`)
+      }
+      return restored
+    })
+  )
+
+  return { key, hit: Boolean(cacheKey) }
 }
 
 async function setupMise(
   version: string,
-  fetchFromGitHub = false
+  fetchFromGitHub = false,
+  resolvedLatestVersion?: string
 ): Promise<void> {
   const miseBinDir = path.join(miseDir(), 'bin')
   const miseBinPath = path.join(
@@ -326,7 +452,8 @@ async function setupMise(
           : (await zstdInstalled())
             ? '.tar.zst'
             : '.tar.gz'
-    let resolvedVersion = version || (await latestMiseVersion())
+    let resolvedVersion =
+      version || resolvedLatestVersion || (await latestMiseVersion())
     resolvedVersion = resolvedVersion.replace(/^v/, '')
     let url: string
     if (!fetchFromGitHub && !version) {
@@ -740,9 +867,6 @@ function hasMatchingLockFile(dir: string, patterns: RegExp[]): boolean {
 }
 
 function miseDir(): string {
-  const dir = core.getState('MISE_DIR')
-  if (dir) return dir
-
   const miseDir = core.getInput('mise_dir')
   if (miseDir) return miseDir
 
@@ -755,18 +879,32 @@ function miseDir(): string {
   return path.join(os.homedir(), '.local', 'share', 'mise')
 }
 
-async function saveCache(cacheKey: string): Promise<void> {
-  await core.group(`Saving mise cache`, async () => {
+/**
+ * Produces a short stable hash of the configured mise data directory.
+ */
+function miseDirHash(): string {
+  return crypto.createHash('sha256').update(miseDir()).digest('hex').slice(0, 8)
+}
+
+/**
+ * Saves the tools cache after mise installs the requested tools.
+ */
+async function saveToolsCache(state: CacheState): Promise<void> {
+  if (!core.getBooleanInput('cache_save') || state.hit || !state.key) {
+    return
+  }
+
+  await core.group(`Saving mise tools cache`, async () => {
     const cachePath = miseDir()
 
     if (!fs.existsSync(cachePath)) {
       throw new Error(`Cache folder path does not exist on disk: ${cachePath}`)
     }
 
-    const cacheId = await cache.saveCache([cachePath], cacheKey)
+    const cacheId = await cache.saveCache([cachePath], state.key)
     if (cacheId === -1) return
 
-    core.info(`Cache saved from ${cachePath} with key: ${cacheKey}`)
+    core.info(`Tools cache saved from ${cachePath} with key: ${state.key}`)
   })
 }
 
@@ -806,9 +944,16 @@ async function processCacheKeyTemplate(template: string): Promise<string> {
   const cacheKeyPrefix = core.getInput('cache_key_prefix') || 'mise-v1'
   const miseEnv = process.env.MISE_ENV?.replace(/,/g, '-')
   const platform = `${await getTarget()}-${getRunnerImageId()}`
+  const workingDirectory =
+    core.getInput('working_directory') || core.getInput('install_dir')
+  const githubWorkspace = path.resolve(
+    process.env.GITHUB_WORKSPACE || process.cwd()
+  )
 
   // Calculate file hash
-  const fileHash = await glob.hashFiles(MISE_CONFIG_FILE_PATTERNS.join('\n'))
+  const fileHash = workingDirectory
+    ? await hashScopedConfigFiles(workingDirectory, githubWorkspace)
+    : await glob.hashFiles(MISE_CONFIG_FILE_PATTERNS.join('\n'))
 
   // Calculate install args hash
   let installArgsHash = ''
@@ -831,12 +976,15 @@ async function processCacheKeyTemplate(template: string): Promise<string> {
       .digest('hex')
   }
 
+  const dirHash = miseDirHash()
+
   // Prepare base template data
   const baseTemplateData = {
     version,
     cache_key_prefix: cacheKeyPrefix,
     platform,
     file_hash: fileHash,
+    dir_hash: dirHash,
     mise_env: miseEnv,
     install_args_hash: installArgsHash,
     bootstrap_hash: bootstrapHash
@@ -865,4 +1013,169 @@ async function isMusl() {
     ignoreReturnCode: true
   })
   return stderr.indexOf('musl') > -1
+}
+
+/**
+ * Hashes the mise config hierarchy that applies to a working directory.
+ *
+ * The scoped path goes through mise itself so inherited parent config and local
+ * overrides match the runtime's view. Env files can show up in that result, so
+ * we filter to mise config material before reading anything into the key.
+ */
+async function hashScopedConfigFiles(
+  workingDirectory: string,
+  githubWorkspace: string
+): Promise<string> {
+  const configFiles = await configFilesForPath(workingDirectory)
+  const hash = crypto.createHash('sha256')
+
+  try {
+    for (const file of configFiles) {
+      const relativePath = path
+        .relative(githubWorkspace, file)
+        .split(path.sep)
+        .join('/')
+
+      if (!fs.existsSync(file)) {
+        core.debug(
+          `Skipping missing mise config file while building cache key: ${relativePath}`
+        )
+        continue
+      }
+
+      const stat = await fs.promises.stat(file)
+      if (!stat.isFile()) {
+        core.debug(
+          `Skipping non-file mise config path while building cache key: ${relativePath}`
+        )
+        continue
+      }
+
+      hash.update(relativePath)
+      hash.update('\0')
+      const content = await fs.promises.readFile(file)
+      hash.update(content)
+      hash.update('\0')
+    }
+  } catch (error) {
+    throw new Error(
+      `Failed to read config file for cache key: ${errorMessage(error)}`,
+      { cause: error }
+    )
+  }
+
+  return hash.digest('hex')
+}
+
+/**
+ * Returns true when a child path is inside a parent path.
+ */
+function isPathWithin(parent: string, child: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(child))
+  return (
+    relative === '' ||
+    (!relative.startsWith('..') && !path.isAbsolute(relative))
+  )
+}
+
+/**
+ * Returns true for paths that should contribute to mise cache keys.
+ */
+function isMiseConfigFile(filePath: string): boolean {
+  const normalized = filePath.split(path.sep).join('/')
+  const basename = path.basename(normalized)
+
+  if (basename === '.tool-versions') {
+    return true
+  }
+
+  if (/^\.?mise(?:\..+)?\.(?:toml|lock)$/.test(basename)) {
+    return true
+  }
+
+  if (!/^config(?:\..+)?\.(?:toml|lock)$/.test(basename)) {
+    return false
+  }
+
+  const parent = path.dirname(normalized)
+  return (
+    parent.endsWith('/.config/mise') ||
+    parent.endsWith('/.mise') ||
+    parent.endsWith('/mise')
+  )
+}
+
+/**
+ * Gets mise config and lock files that affect a working directory.
+ */
+async function configFilesForPath(workingDirectory: string): Promise<string[]> {
+  const githubWorkspace = path.resolve(
+    process.env.GITHUB_WORKSPACE || process.cwd()
+  )
+  const cwd = path.resolve(githubWorkspace, workingDirectory)
+  const miseBinPath = path.join(
+    miseDir(),
+    'bin',
+    process.platform === 'win32' ? 'mise.exe' : 'mise'
+  )
+
+  try {
+    const output = await exec.getExecOutput(
+      miseBinPath,
+      ['config', 'ls', '--json'],
+      {
+        cwd,
+        silent: true
+      }
+    )
+
+    const configs: Array<{ path?: unknown }> = JSON.parse(output.stdout)
+    const configFiles: string[] = []
+
+    for (const config of configs) {
+      if (typeof config.path !== 'string') {
+        continue
+      }
+
+      const configPath = path.isAbsolute(config.path)
+        ? config.path
+        : path.resolve(cwd, config.path)
+
+      if (!isPathWithin(githubWorkspace, configPath)) {
+        continue
+      }
+
+      if (!isMiseConfigFile(configPath)) {
+        core.debug(
+          `Skipping non-mise config path while building cache key: ${configPath}`
+        )
+        continue
+      }
+
+      configFiles.push(configPath)
+
+      let lockPath: string | undefined
+      if (configPath.endsWith('.toml')) {
+        lockPath = configPath.replace(/\.toml$/, '.lock')
+      } else if (configPath.endsWith('.tool-versions')) {
+        lockPath = path.join(path.dirname(configPath), 'mise.lock')
+      }
+
+      if (
+        lockPath &&
+        fs.existsSync(lockPath) &&
+        isPathWithin(githubWorkspace, lockPath) &&
+        isMiseConfigFile(lockPath)
+      ) {
+        configFiles.push(lockPath)
+      }
+    }
+
+    return Array.from(new Set(configFiles)).sort()
+  } catch (error) {
+    throw new Error(
+      `Failed to get config files for working_directory "${workingDirectory}": ${errorMessage(error)}`,
+      { cause: error }
+    )
+  }
 }
